@@ -1,0 +1,14 @@
+replicaCount: 2
+color: blue
+
+gateway:
+  enabled: false   # ⚠️ DO NOT set to true here — pipeline controls this via --set
+  name: my-gateway
+  namespace: default
+  hostname: ctf-config-service-ncr2dev.zindagi.tech
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  cpuUtilization: 70

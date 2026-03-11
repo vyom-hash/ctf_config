@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ctf-config-service.name" . }}-{{ .Values.color }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: ctf-config-service
+      color: {{ .Values.color }}
+  template:
+    metadata:
+      labels:
+        app: ctf-config-service
+        color: {{ .Values.color }}
+    spec:
+      containers:
+        - name: ctf-config-service
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: {{ toYaml .Values.container.command | nindent 12 }}
+          args: {{ toYaml .Values.container.args | nindent 12 }}
+          ports:
+            - containerPort: {{ .Values.container.port }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

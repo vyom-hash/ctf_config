@@ -1,0 +1,165 @@
+name: ctf-config-service
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Service start-order
+#   db (healthy) ─┐
+#                  ├──▶ migrate (exits 0) ──▶ app (healthy)
+#   redis (healthy)┘
+#
+# Scaling the app  (example: 3 replicas behind a load balancer)
+#   docker compose up --scale app=3
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL 16 ───────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: ctf_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-ctf_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
+      POSTGRES_DB:       ${POSTGRES_DB:-ctf_config}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"   # remove port binding in production
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-ctf_user} -d $${POSTGRES_DB:-ctf_config}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - ctf_net
+
+
+  # ── Redis 7 ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ctf_redis
+    restart: unless-stopped
+    # AOF persistence + RDB snapshot every 60 s if ≥ 1 key changed
+    command: >
+      redis-server
+        --save 60 1
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"      # remove port binding in production
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      - ctf_net
+
+
+  # ── Database migrations (one-shot, exits 0 on success) ──────────────────────
+  #
+  # Runs `alembic upgrade head` against the live database before the app boots.
+  # Compose waits for this container to exit successfully before starting `app`.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: ctf-config-service:latest
+    container_name: ctf_migrate
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"                         # must NOT restart — one-shot only
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-ctf_user}:${POSTGRES_PASSWORD:-secret}@db:5432/${POSTGRES_DB:-ctf_config}"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - ctf_net
+
+
+  # ── FastAPI application ─────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: ctf-config-service:latest
+    container_name: ctf_app
+    restart: unless-stopped
+
+    # ── Environment ────────────────────────────────────────────────────────────
+    # Override any of these via a .env file in the project root.
+    # The DATABASE_URL uses the Docker network service name `db`, not localhost.
+    environment:
+      # Database
+      DATABASE_URL:       "postgresql+asyncpg://${POSTGRES_USER:-ctf_user}:${POSTGRES_PASSWORD:-secret}@ctf_postgres:5432/${POSTGRES_DB:-ctf_config}"
+      DB_POOL_SIZE:       "${DB_POOL_SIZE:-20}"
+      DB_MAX_OVERFLOW:    "${DB_MAX_OVERFLOW:-10}"
+      DB_POOL_TIMEOUT:    "30"
+      DB_POOL_RECYCLE:    "1800"
+
+      # Redis
+      REDIS_URL:                  "redis://redis:6379/0"
+      REDIS_POOL_MAX_CONNECTIONS: "${REDIS_POOL_MAX_CONNECTIONS:-50}"
+
+      # Security  ← CHANGE THIS in production
+      SECRET_KEY:                   "${SECRET_KEY:-change-me-to-a-256-bit-secret}"
+      ALGORITHM:                    "HS256"
+      ACCESS_TOKEN_EXPIRE_MINUTES:  "${ACCESS_TOKEN_EXPIRE_MINUTES:-60}"
+
+      # Application
+      ENVIRONMENT: "${ENVIRONMENT:-production}"
+      DEBUG:       "${DEBUG:-false}"
+
+      # Rate limiting
+      FLAG_SUBMIT_MAX_ATTEMPTS:   "${FLAG_SUBMIT_MAX_ATTEMPTS:-5}"
+      FLAG_SUBMIT_WINDOW_SECONDS: "${FLAG_SUBMIT_WINDOW_SECONDS:-60}"
+
+      # Cache TTL
+      LEADERBOARD_CACHE_TTL: "${LEADERBOARD_CACHE_TTL:-30}"
+      CHALLENGE_CACHE_TTL:   "${CHALLENGE_CACHE_TTL:-300}"
+
+      # Approval workflow
+      AUTO_APPROVE_RECIPES: "${AUTO_APPROVE_RECIPES:-true}"
+
+    ports:
+      - "${APP_PORT:-8020}:8000"
+
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    networks:
+      - ctf_net
+
+
+# ── Named volumes ──────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+
+# ── Internal network ──────────────────────────────────────────────────────────
+# Services talk to each other by service name.
+# Only `app` and the two backing stores need to share this network.
+networks:
+  ctf_net:
+    driver: bridge
