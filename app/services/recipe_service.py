@@ -1,16 +1,10 @@
 """
 Recipe Service — orchestration layer for the 9-step draft → publish flow.
-
-Responsibilities
-────────────────
-• Translate HTTP inputs into repository calls.
-• Enforce business rules (validate draft, serialize blueprint, checksum).
-• Own the transaction boundary (session is committed by the FastAPI dependency
-  after the service returns; errors trigger automatic rollback).
 """
 from __future__ import annotations
 
 import hashlib
+import math
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -30,19 +24,19 @@ from app.api.schemas.recipe import (
     DraftDetailResponse,
     DraftResponse,
     DraftUpdate,
-    ExposureRuleResponse,
     GatewayCreate,
     GatewayResponse,
     GatewayUpdate,
+    GlobalDomainConfig,
+    GlobalDomainResponse,
+    IngressPolicyResponse,
     ListRecipesResponse,
-    NetworkProfileConfig,
-    NetworkProfileResponse,
+    PublishedAccessBox,
     PublishedAutomationProfile,
     PublishedDomain,
-    PublishedExposureRule,
     PublishedGateway,
-    PublishedJumphostUnit,
-    PublishedNetworkProfile,
+    PublishedGlobalDomain,
+    PublishedIngressPolicy,
     PublishedRecipeResponse,
     PublishedRoutingRule,
     PublishedWorkloadUnit,
@@ -53,19 +47,62 @@ from app.api.schemas.recipe import (
     WorkloadUnitCreate,
     WorkloadUnitResponse,
     WorkloadUnitUpdate,
+    JumphostUnitInput,
 )
-from app.api.schemas.exercise_instance import (
-    ExerciseInstanceResponse,
-    ExerciseWithRecipeResponse,
+from app.api.schemas.challenge import (
+    ChallengeResponse,
+    ChallengeWithRecipeResponse,
     RecipeSubset,
 )
-from app.models.exercise_instance import ExerciseInstance
-from app.models.recipe import Recipe, RecipeVersion
+from app.models.challenge import Challenge
+from app.models.recipe import Recipe, RecipeVersion, RecipeWorkloadUnit
 from app.repositories.deployment_repository import DeploymentRepository
 from app.repositories.recipe_repository import RecipeRepository
 
 _repo = RecipeRepository()
 _deployment_repo = DeploymentRepository()
+
+
+# ─────────────────────────────── Domain size calculation ─────────────────────
+
+def _calculate_domain_size(workload_unit_count: int) -> int:
+    """
+    Calculate the minimum CIDR subnet mask for a domain given the number of workload units.
+
+    First 5 IPs and last 3 IPs are reserved (8 total).
+    Returns the mask (e.g. 28 for /28).
+    """
+    total_needed = workload_unit_count + 8
+    for mask in range(30, 7, -1):
+        if (1 << (32 - mask)) >= total_needed:
+            return mask
+    return 8  # fallback for very large counts
+
+
+async def _recalculate_domain_sizes(
+    session: AsyncSession, recipe_id: uuid.UUID
+) -> None:
+    """Recalculate domain_size for all domains based on assigned workload units + jumphost."""
+    recipe = await _repo.get_full_recipe(session, recipe_id)
+    if not recipe:
+        return
+
+    domain_counts: dict[str, int] = {}
+    for unit in recipe.workload_units:
+        if unit.assigned_domain:
+            domain_counts[unit.assigned_domain] = domain_counts.get(unit.assigned_domain, 0) + 1
+
+    # Count jumphost if it has an assigned_domain
+    if recipe.enable_jumphost and isinstance(recipe.jumphost_config, dict):
+        jh_domain = recipe.jumphost_config.get("assigned_domain")
+        if jh_domain:
+            domain_counts[jh_domain] = domain_counts.get(jh_domain, 0) + 1
+
+    for domain in recipe.network_domains:
+        count = domain_counts.get(domain.name, 0)
+        domain.domain_size = _calculate_domain_size(count) if count > 0 else None
+
+    await session.flush()
 
 
 # ─────────────────────────────── Step 1 — Create draft ───────────────────────
@@ -93,12 +130,9 @@ async def list_drafts(
     page: int = 1,
     page_size: int = 20,
 ) -> ListRecipesResponse:
-    """List recipe drafts with pagination. Returns Google-style list envelope."""
     page_size = min(max(1, page_size), 100)
     page = max(1, page)
-    rows, total = await _repo.list_drafts(
-        session, page=page, page_size=page_size
-    )
+    rows, total = await _repo.list_drafts(session, page=page, page_size=page_size)
     items = [
         RecipeListItem(
             id=r.id,
@@ -112,28 +146,25 @@ async def list_drafts(
         for r in rows
     ]
     has_more = (page * page_size) < total
-    next_page_token = str(page + 1) if has_more else None
     return ListRecipesResponse(
         items=items,
-        next_page_token=next_page_token,
+        next_page_token=str(page + 1) if has_more else None,
         total_size=total,
     )
 
 
-# ─────────────────────────────── Step 2 — Network profile ────────────────────
+# ─────────────────────────────── Step 2 — Global domain ──────────────────────
 
-async def configure_network_profile(
+async def configure_global_domain(
     session: AsyncSession,
     recipe_id: uuid.UUID,
-    payload: NetworkProfileConfig,
+    payload: GlobalDomainConfig,
 ) -> None:
     await _assert_recipe_exists(session, recipe_id)
     await _repo.upsert_network_profile(
         session,
         recipe_id=recipe_id,
-        segmentation_strategy=payload.segmentation_strategy,
-        default_subnet_mask=payload.default_subnet_mask,
-        gateway_offset=payload.gateway_offset,
+        gateway_offset=payload.gw_offset,
     )
     await _repo.replace_dns_resolvers(
         session, recipe_id=recipe_id, addresses=payload.dns_resolvers
@@ -151,9 +182,9 @@ async def add_domain(
     await _repo.add_domain(
         session,
         recipe_id=recipe_id,
-        domain_key=payload.domain_key,
+        name=payload.name,
         description=payload.description,
-        public_ingress_enabled=payload.public_ingress_enabled,
+        enable_egress=payload.enable_egress,
     )
 
 
@@ -171,16 +202,56 @@ async def add_workload_unit(
     await _repo.add_workload_unit(
         session,
         recipe_id=recipe_id,
-        unit_key=payload.unit_key,
-        functional_role=payload.functional_role,
-        network_position_index=payload.network_position_index,
+        name=payload.name,
+        description=payload.description,
+        allocation_index=payload.allocation_index,
         runtime_profile=payload.runtime_profile,
         resource_tier=payload.resource_tier,
         assigned_domain=payload.assigned_domain,
-        connectivity_profile=payload.connectivity_profile,
-        agent_enabled=payload.agent_enabled,
+        access_method=payload.access_method,
+        unit_control_active=payload.unit_control_active,
         automation=automation,
     )
+    # Recalculate domain sizes after adding a unit
+    await _recalculate_domain_sizes(session, recipe_id)
+
+
+# ─────────────────────────────── Jumphost helper ─────────────────────────────
+
+_JUMPHOST_DEFAULTS = {
+    "enable": True,
+    "allow_vnc": True,
+    "resource_tier": "md",
+    "assigned_domain": "internal",
+    "domain": "internal",
+    "runtime_profile": "oe:jumphost",
+    "egress_ip": False,
+    "allocation_index": 5,
+}
+
+
+def _jumphost_config(recipe: Recipe) -> dict:
+    """Return stored jumphost_config or fall back to defaults."""
+    stored = getattr(recipe, "jumphost_config", None)
+    return stored if isinstance(stored, dict) else dict(_JUMPHOST_DEFAULTS)
+
+
+async def set_jumphost_unit(
+    session: AsyncSession,
+    recipe_id: uuid.UUID,
+    payload: JumphostUnitInput,
+) -> dict:
+    """Persist jumphost unit config on the recipe and return the stored dict."""
+    recipe = await _load_full_or_404(session, recipe_id)
+    config = payload.model_dump()
+    # Map assigned_domain → domain for consistency
+    config["domain"] = config.get("assigned_domain", config.get("domain", ""))
+    recipe.jumphost_config = config
+    recipe.enable_jumphost = config["enable"]
+    await session.flush()
+    # Recalculate domain sizes
+    await _recalculate_domain_sizes(session, recipe_id)
+    return config
 
 
 # ─────────────────────────────── Step 5 — Gateways ───────────────────────────
@@ -191,7 +262,7 @@ async def add_gateway(
     payload: GatewayCreate,
 ) -> None:
     await _assert_recipe_exists(session, recipe_id)
-    rules = [r.model_dump() for r in payload.exposure_rules]
+    rules = [r.model_dump() for r in payload.ingress_policies]
     await _repo.add_gateway(
         session,
         recipe_id=recipe_id,
@@ -200,7 +271,9 @@ async def add_gateway(
         runtime_profile=payload.runtime_profile,
         resource_tier=payload.resource_tier,
         is_active=payload.is_active,
-        exposure_rules=rules,
+        secure_shell=payload.secure_shell,
+        egress_ip=payload.egress_ip,
+        ingress_policies=rules,
     )
 
 
@@ -219,10 +292,6 @@ async def validate_draft(
 async def publish_draft(
     session: AsyncSession, recipe_id: uuid.UUID
 ) -> PublishedRecipeResponse:
-    # ── Approval gate ────────────────────────────────────────────────────────
-    # Draft must have been explicitly submitted and approved before it can be
-    # published.  When AUTO_APPROVE_RECIPES=True the submit step does this
-    # automatically; otherwise a human reviewer must approve first.
     draft = await _repo.get_draft_by_id(session, recipe_id)
     if draft is None:
         raise HTTPException(
@@ -240,8 +309,6 @@ async def publish_draft(
         )
 
     recipe = await _load_full_or_404(session, recipe_id)
-
-    # Re-validate before publish
     errors = _run_validation_checks(recipe)
     if errors:
         raise HTTPException(
@@ -249,15 +316,12 @@ async def publish_draft(
             detail={"message": "Draft failed validation", "errors": errors},
         )
 
-    # SHA-256 checksum derived from the canonical BlueprintSnapshot JSON
-    # (kept stable across format changes to the published response shape)
     blueprint = _serialize_blueprint(recipe)
     checksum = hashlib.sha256(blueprint.model_dump_json(indent=None).encode()).hexdigest()
 
     next_version = await _repo.get_next_version_number(session, recipe_id)
     published_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Persist version row
     version = await _repo.create_version(
         session,
         recipe_id=recipe_id,
@@ -265,7 +329,6 @@ async def publish_draft(
         checksum=checksum,
     )
 
-    # Build the hardened published response and store it as the snapshot
     published = _build_published_response(
         recipe=recipe,
         version_id=version.id,
@@ -290,37 +353,37 @@ async def publish_draft(
 def _run_validation_checks(recipe: Recipe) -> list[str]:
     errors: list[str] = []
 
-    domain_keys = {d.domain_key for d in recipe.network_domains}
-    unit_keys = {u.unit_key for u in recipe.workload_units}
+    domain_names = {d.name for d in recipe.network_domains}
+    unit_names = {u.name for u in recipe.workload_units}
 
     # 1. Unit → domain mapping
     for unit in recipe.workload_units:
-        if unit.assigned_domain and unit.assigned_domain not in domain_keys:
+        if unit.assigned_domain and unit.assigned_domain not in domain_names:
             errors.append(
-                f"Unit '{unit.unit_key}': assigned_domain '{unit.assigned_domain}' does not exist"
+                f"Unit '{unit.name}': assigned_domain '{unit.assigned_domain}' does not exist"
             )
 
-    # 2. No duplicate network_position_index
+    # 2. No duplicate allocation_index
     indices = [
-        u.network_position_index
+        u.allocation_index
         for u in recipe.workload_units
-        if u.network_position_index is not None
+        if u.allocation_index is not None
     ]
     if len(indices) != len(set(indices)):
-        errors.append("Duplicate network_position_index values detected in workload units")
+        errors.append("Duplicate allocation_index values detected in workload units")
 
     # 3. Routing rules reference existing domains
     for rule in recipe.domain_routing_rules:
-        if rule.source_domain and rule.source_domain not in domain_keys:
+        if rule.source_domain and rule.source_domain not in domain_names:
             errors.append(
                 f"Routing rule: source_domain '{rule.source_domain}' does not exist"
             )
-        if rule.destination_domain and rule.destination_domain not in domain_keys:
+        if rule.destination_domain and rule.destination_domain not in domain_names:
             errors.append(
                 f"Routing rule: destination_domain '{rule.destination_domain}' does not exist"
             )
 
-    # 4. No circular routing (DFS cycle detection on allow-policy edges)
+    # 4. No circular routing
     allow_graph: dict[str, set[str]] = {}
     for rule in recipe.domain_routing_rules:
         if rule.routing_policy == "allow" and rule.source_domain and rule.destination_domain:
@@ -328,13 +391,13 @@ def _run_validation_checks(recipe: Recipe) -> list[str]:
     if _has_cycle(allow_graph):
         errors.append("Circular routing detected in domain routing rules")
 
-    # 5. Gateway exposure rules → unit_key exists (no assigned gateway / attached_domain)
+    # 5. Gateway ingress policies → wl_unit exists
     for gw in recipe.access_gateways:
         for rule in gw.exposure_rules:
-            if rule.unit_key and rule.unit_key not in unit_keys:
+            if rule.wl_unit and rule.wl_unit not in unit_names:
                 errors.append(
-                    f"Gateway '{gw.gateway_key}' exposure rule references "
-                    f"non-existent unit_key '{rule.unit_key}'"
+                    f"Gateway '{gw.gateway_key}' ingress policy references "
+                    f"non-existent unit '{rule.wl_unit}'"
                 )
 
     return errors
@@ -371,13 +434,12 @@ def _has_cycle(graph: dict[str, set[str]]) -> bool:
 # ─────────────────────────────── Blueprint serialiser ────────────────────────
 
 def _serialize_blueprint(recipe: Recipe) -> BlueprintSnapshot:
-    net_profile = None
+    global_domain = None
     if recipe.network_profiles:
         p = recipe.network_profiles[0]
-        net_profile = {
-            "segmentation_strategy": p.segmentation_strategy,
-            "default_subnet_mask": p.default_subnet_mask,
-            "gateway_offset": p.gateway_offset,
+        global_domain = {
+            "gw_offset": p.gateway_offset,
+            "dns": [r.resolver_address for r in recipe.dns_resolvers],
         }
 
     return BlueprintSnapshot(
@@ -386,13 +448,13 @@ def _serialize_blueprint(recipe: Recipe) -> BlueprintSnapshot:
         description=recipe.description,
         category=recipe.category,
         enable_jumphost=recipe.enable_jumphost,
-        network_profile=net_profile,
-        dns_resolvers=[r.resolver_address for r in recipe.dns_resolvers],
+        global_domain=global_domain,
         network_domains=[
             {
-                "domain_key": d.domain_key,
-                "description": d.description,
-                "public_ingress_enabled": d.public_ingress_enabled,
+                "name": d.name,
+                "desc": d.description,
+                "enable_egress": d.enable_egress,
+                "domain_size": d.domain_size,
             }
             for d in recipe.network_domains
         ],
@@ -406,19 +468,19 @@ def _serialize_blueprint(recipe: Recipe) -> BlueprintSnapshot:
         ],
         workload_units=[
             {
-                "unit_key": u.unit_key,
-                "functional_role": u.functional_role,
-                "network_position_index": u.network_position_index,
+                "name": u.name,
+                "description": u.description,
+                "allocation_index": u.allocation_index,
                 "runtime_profile": u.runtime_profile,
                 "resource_tier": u.resource_tier,
                 "assigned_domain": u.assigned_domain,
-                "connectivity_profile": u.connectivity_profile,
-                "agent_enabled": u.agent_enabled,
-                "automation_profile": (
+                "access_method": u.access_method,
+                "unit_control_active": u.unit_control_active,
+                "automations": (
                     {
-                        "bootstrap_reference": u.automation_profile.bootstrap_reference,
-                        "initialization_reference": u.automation_profile.initialization_reference,
-                        "health_check_reference": u.automation_profile.health_check_reference,
+                        "bootstrap_automation": u.automation_profile.bootstrap_automation,
+                        "preflight_automation": u.automation_profile.preflight_automation,
+                        "heartbeat_automation": u.automation_profile.heartbeat_automation,
                     }
                     if u.automation_profile
                     else None
@@ -433,27 +495,24 @@ def _serialize_blueprint(recipe: Recipe) -> BlueprintSnapshot:
                 "runtime_profile": g.runtime_profile,
                 "resource_tier": g.resource_tier,
                 "is_active": g.is_active,
-                "exposure_rules": [
+                "secure_shell": g.secure_shell,
+                "egress_ip": g.egress_ip,
+                "ingress_policies": [
                     {
-                        "unit_key": r.unit_key,
-                        "internal_port": r.internal_port,
-                        "transport_protocol": r.transport_protocol,
+                        "wl_unit": r.wl_unit,
+                        "int_port": r.int_port,
+                        "proto": r.proto,
+                        "name": r.rule_name,
+                        "desc": r.rule_desc,
+                        "ext_port": r.ext_port,
                     }
                     for r in g.exposure_rules
                 ],
             }
             for g in recipe.access_gateways
         ],
-        jumphost_unit=(
-            {
-                "enabled": True,
-                "assigned_domain": "internal",
-                "runtime_profile": "oe:jumphost",
-                "enable_vnc": True,
-                "network_position_index": 5,
-                "resource_tier": "md",
-                "enable_floating_ip": False,
-            }
+        access_box=(
+            _jumphost_config(recipe)
             if getattr(recipe, "enable_jumphost", True)
             else None
         ),
@@ -469,107 +528,92 @@ def _build_published_response(
     checksum: str,
     published_at: str,
 ) -> PublishedRecipeResponse:
-    """
-    Build the production-grade immutable published recipe response.
-
-    Key differences from the draft view:
-    • routing_rules are embedded inside network_profile
-    • Exposure rules reference unit_id (UUID), not the mutable unit_key string
-    • Null optional fields are stripped from workload units
-    • connectivity_profile is excluded (runtime concern, not recipe config)
-    """
-    unit_key_to_id: dict[str, uuid.UUID] = {
-        u.unit_key: u.id for u in recipe.workload_units
+    """Build the immutable published recipe snapshot."""
+    unit_name_to_id: dict[str, uuid.UUID] = {
+        u.name: u.id for u in recipe.workload_units
     }
 
-    # ── Network profile + routing rules ──────────────────────────────────────
-    net_profile = None
+    # ── Global domain ─────────────────────────────────────────────────────────
+    global_domain = None
     if recipe.network_profiles:
         p = recipe.network_profiles[0]
-        routing_rules = [
-            PublishedRoutingRule(
-                source_domain=r.source_domain,
-                destination_domain=r.destination_domain,
-                routing_policy=r.routing_policy,
-            )
-            for r in recipe.domain_routing_rules
-            if r.source_domain and r.destination_domain and r.routing_policy
-        ]
-        net_profile = PublishedNetworkProfile(
-            segmentation_strategy=p.segmentation_strategy,
-            default_subnet_mask=p.default_subnet_mask,
-            gateway_offset=p.gateway_offset,
-            dns_resolvers=[r.resolver_address for r in recipe.dns_resolvers],
-            routing_rules=routing_rules,
+        global_domain = PublishedGlobalDomain(
+            dns=[r.resolver_address for r in recipe.dns_resolvers],
+            gw_offset=p.gateway_offset,
         )
 
     # ── Domains ──────────────────────────────────────────────────────────────
     domains = [
         PublishedDomain(
             id=d.id,
-            domain_key=d.domain_key,
-            description=d.description,
-            public_ingress_enabled=d.public_ingress_enabled,
+            name=d.name,
+            desc=d.description,
+            enable_egress=d.enable_egress,
+            domain_size=d.domain_size,
         )
         for d in recipe.network_domains
     ]
 
-    # ── Workload units (no connectivity_profile, nulls stripped) ─────────────
+    # ── Workload units ────────────────────────────────────────────────────────
     workload_units = []
     for u in recipe.workload_units:
         ap = None
         if u.automation_profile:
             ap = PublishedAutomationProfile(
-                bootstrap_reference=u.automation_profile.bootstrap_reference,
-                initialization_reference=u.automation_profile.initialization_reference,
-                health_check_reference=u.automation_profile.health_check_reference,
+                bootstrap_automation=u.automation_profile.bootstrap_automation,
+                preflight_automation=u.automation_profile.preflight_automation,
+                heartbeat_automation=u.automation_profile.heartbeat_automation,
             )
         workload_units.append(PublishedWorkloadUnit(
             id=u.id,
-            unit_key=u.unit_key,
-            functional_role=u.functional_role,
-            network_position_index=u.network_position_index,
+            name=u.name,
+            description=u.description,
+            allocation_index=u.allocation_index,
             runtime_profile=u.runtime_profile,
             resource_tier=u.resource_tier,
             assigned_domain=u.assigned_domain,
-            agent_enabled=u.agent_enabled,
-            automation_profile=ap,
+            access_method=u.access_method,
+            unit_control_active=u.unit_control_active,
+            automations=ap,
         ))
 
-    # ── Gateways (exposure rules use unit_id) ────────────────────────────────
+    # ── Gateways (ingress policies use unit_id) ───────────────────────────────
     gateways = []
     for g in recipe.access_gateways:
-        exposure_rules = [
-            PublishedExposureRule(
-                unit_id=unit_key_to_id[r.unit_key],
-                internal_port=r.internal_port,
-                transport_protocol=r.transport_protocol,
+        ingress_policies = [
+            PublishedIngressPolicy(
+                unit_id=unit_name_to_id[r.wl_unit],
+                name=r.rule_name,
+                proto=r.proto,
+                desc=r.rule_desc,
+                ext_port=r.ext_port,
+                int_port=r.int_port,
             )
             for r in g.exposure_rules
-            if r.unit_key and r.unit_key in unit_key_to_id
-            and r.internal_port and r.transport_protocol
+            if r.wl_unit and r.wl_unit in unit_name_to_id
+            and r.int_port and r.proto
         ]
         gateways.append(PublishedGateway(
             id=g.id,
-            gateway_key=g.gateway_key,
-            gateway_type=g.gateway_type or "",
+            secure_shell=g.secure_shell,
             runtime_profile=g.runtime_profile,
             resource_tier=g.resource_tier,
-            exposure_rules=exposure_rules,
+            egress_ip=g.egress_ip,
+            ingress_policies=ingress_policies,
         ))
 
-    # ── Scoring and challenges are not part of recipe; omitted from snapshot ───
-
-    jumphost_unit = None
+    # ── Access box (jumphost) ─────────────────────────────────────────────────
+    access_box = None
     if getattr(recipe, "enable_jumphost", True):
-        jumphost_unit = PublishedJumphostUnit(
-            enabled=True,
-            assigned_domain="internal",
-            runtime_profile="oe:jumphost",
-            enable_vnc=True,
-            network_position_index=5,
-            resource_tier="md",
-            enable_floating_ip=False,
+        cfg = _jumphost_config(recipe)
+        access_box = PublishedAccessBox(
+            enable=cfg.get("enable", True),
+            domain=cfg.get("domain") or cfg.get("assigned_domain", ""),
+            runtime_profile=cfg.get("runtime_profile", ""),
+            resource_tier=cfg.get("resource_tier", ""),
+            allocation_index=cfg.get("allocation_index", 5),
+            egress_ip=cfg.get("egress_ip", False),
+            allow_vnc=cfg.get("allow_vnc", True),
         )
 
     return PublishedRecipeResponse(
@@ -583,19 +627,17 @@ def _build_published_response(
             category=recipe.category,
             enable_jumphost=recipe.enable_jumphost,
         ),
-        network_profile=net_profile,
+        global_domain=global_domain,
         domains=domains,
         workload_units=workload_units,
         gateways=gateways,
-        jumphost_unit=jumphost_unit,
+        access_box=access_box,
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  GET / UPDATE endpoints — service layer
 # ═══════════════════════════════════════════════════════════════════════════════
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _gateway_to_response(gw) -> GatewayResponse:
     return GatewayResponse(
@@ -606,7 +648,12 @@ def _gateway_to_response(gw) -> GatewayResponse:
         runtime_profile=gw.runtime_profile,
         resource_tier=gw.resource_tier,
         is_active=gw.is_active,
-        exposure_rules=[ExposureRuleResponse.model_validate(r) for r in (gw.exposure_rules or [])],
+        secure_shell=gw.secure_shell,
+        egress_ip=gw.egress_ip,
+        ingress_policies=[
+            IngressPolicyResponse.from_orm_rule(r)
+            for r in (gw.exposure_rules or [])
+        ],
     )
 
 
@@ -617,24 +664,23 @@ def _unit_to_response(u) -> WorkloadUnitResponse:
     return WorkloadUnitResponse(
         id=u.id,
         recipe_id=u.recipe_id,
-        unit_key=u.unit_key,
-        functional_role=u.functional_role,
-        network_position_index=u.network_position_index,
+        name=u.name,
+        description=u.description,
+        allocation_index=u.allocation_index,
         runtime_profile=u.runtime_profile,
         resource_tier=u.resource_tier,
         assigned_domain=u.assigned_domain,
-        connectivity_profile=u.connectivity_profile,
-        agent_enabled=u.agent_enabled,
+        access_method=u.access_method,
+        unit_control_active=u.unit_control_active,
         automation_profile=ap,
     )
 
 
-# ── Exercises loader (superset data for exercises field) ──────────────────────
+# ── Exercises loader ──────────────────────────────────────────────────────────
 
 async def _load_exercises_for_recipe(
     session: AsyncSession, recipe_id: uuid.UUID, recipe: Recipe
-) -> list[ExerciseWithRecipeResponse]:
-    """Load all active ExerciseInstances for any version of a recipe, with recipe subset embedded."""
+) -> list[ChallengeWithRecipeResponse]:
     version_result = await session.execute(
         select(RecipeVersion).where(RecipeVersion.recipe_id == recipe_id)
     )
@@ -644,17 +690,17 @@ async def _load_exercises_for_recipe(
     version_id_to_num = {v.id: v.version_number for v in versions}
 
     ei_result = await session.execute(
-        select(ExerciseInstance)
+        select(Challenge)
         .options(
-            selectinload(ExerciseInstance.validation_targets),
-            selectinload(ExerciseInstance.guidance_steps),
-            selectinload(ExerciseInstance.attachments),
-            selectinload(ExerciseInstance.point_checkpoints),
-            selectinload(ExerciseInstance.dependencies),
+            selectinload(Challenge.validation_targets),
+            selectinload(Challenge.hints),
+            selectinload(Challenge.attachments),
+            selectinload(Challenge.objectives),
+            selectinload(Challenge.dependencies),
         )
         .where(
-            ExerciseInstance.recipe_version_id.in_(list(version_id_to_num.keys())),
-            ExerciseInstance.deleted_at.is_(None),
+            Challenge.recipe_version_id.in_(list(version_id_to_num.keys())),
+            Challenge.deleted_at.is_(None),
         )
     )
     instances = ei_result.scalars().all()
@@ -669,8 +715,8 @@ async def _load_exercises_for_recipe(
             recipe_version_id=ei.recipe_version_id,
         )
         result.append(
-            ExerciseWithRecipeResponse(
-                **ExerciseInstanceResponse.model_validate(ei).model_dump(),
+            ChallengeWithRecipeResponse(
+                **ChallengeResponse.model_validate(ei).model_dump(),
                 recipe=recipe_subset,
             )
         )
@@ -690,16 +736,15 @@ async def get_draft_detail(
         )
     recipe = await _load_full_or_404(session, recipe_id)
 
-    net_profile = None
+    global_domain = None
     if recipe.network_profiles:
         p = recipe.network_profiles[0]
         dns = [r.resolver_address for r in recipe.dns_resolvers]
-        net_profile = NetworkProfileResponse(
-            id=p.id, recipe_id=p.recipe_id,
-            segmentation_strategy=p.segmentation_strategy,
-            default_subnet_mask=p.default_subnet_mask,
-            gateway_offset=p.gateway_offset,
-            dns_resolvers=dns,
+        global_domain = GlobalDomainResponse(
+            id=p.id,
+            recipe_id=p.recipe_id,
+            gw_offset=p.gateway_offset,
+            dns=dns,
         )
 
     exercises = await _load_exercises_for_recipe(session, recipe_id, recipe)
@@ -711,8 +756,8 @@ async def get_draft_detail(
         category=draft.category,
         enable_jumphost=recipe.enable_jumphost,
         approval_status=draft.approval_status,
-        network_profile=net_profile,
-        domains=[DomainResponse.model_validate(d) for d in recipe.network_domains],
+        global_domain=global_domain,
+        domains=[DomainResponse.from_orm_domain(d) for d in recipe.network_domains],
         workload_units=[_unit_to_response(u) for u in recipe.workload_units],
         exercises=exercises,
         gateways=[_gateway_to_response(gw) for gw in recipe.access_gateways],
@@ -728,24 +773,22 @@ async def update_draft(
     return await get_draft_detail(session, recipe_id)
 
 
-# ── Network profile ───────────────────────────────────────────────────────────
+# ── Global domain ─────────────────────────────────────────────────────────────
 
-async def get_network_profile(
+async def get_global_domain(
     session: AsyncSession, recipe_id: uuid.UUID
-) -> NetworkProfileResponse:
+) -> GlobalDomainResponse:
     await _assert_recipe_exists(session, recipe_id)
     recipe = await _load_full_or_404(session, recipe_id)
     if not recipe.network_profiles:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail="Network profile not configured for this draft")
+                            detail="Global domain not configured for this recipe")
     p = recipe.network_profiles[0]
     dns = [r.resolver_address for r in recipe.dns_resolvers]
-    return NetworkProfileResponse(
+    return GlobalDomainResponse(
         id=p.id, recipe_id=p.recipe_id,
-        segmentation_strategy=p.segmentation_strategy,
-        default_subnet_mask=p.default_subnet_mask,
-        gateway_offset=p.gateway_offset,
-        dns_resolvers=dns,
+        gw_offset=p.gateway_offset,
+        dns=dns,
     )
 
 
@@ -755,7 +798,7 @@ async def list_domains(
     session: AsyncSession, recipe_id: uuid.UUID
 ) -> list[DomainResponse]:
     recipe = await _load_full_or_404(session, recipe_id)
-    return [DomainResponse.model_validate(d) for d in recipe.network_domains]
+    return [DomainResponse.from_orm_domain(d) for d in recipe.network_domains]
 
 
 async def get_domain(
@@ -765,7 +808,7 @@ async def get_domain(
     domain = await _repo.get_domain_by_id(session, domain_id)
     if domain is None or domain.recipe_id != recipe_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Domain not found")
-    return DomainResponse.model_validate(domain)
+    return DomainResponse.from_orm_domain(domain)
 
 
 async def update_domain(
@@ -776,8 +819,9 @@ async def update_domain(
     if domain is None or domain.recipe_id != recipe_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Domain not found")
     updates = payload.model_dump(exclude_unset=True)
+    # Map schema field "description" from DomainUpdate if present
     domain = await _repo.update_domain(session, domain=domain, updates=updates)
-    return DomainResponse.model_validate(domain)
+    return DomainResponse.from_orm_domain(domain)
 
 
 async def delete_domain(
@@ -787,6 +831,7 @@ async def delete_domain(
     deleted = await _repo.delete_domain_by_id(session, recipe_id=recipe_id, domain_id=domain_id)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Domain not found")
+    await _recalculate_domain_sizes(session, recipe_id)
 
 
 # ── Workload units ────────────────────────────────────────────────────────────
@@ -818,6 +863,7 @@ async def update_unit(
     updates = payload.model_dump(exclude_unset=True)
     automation = updates.pop("automation_profile", None)
     unit = await _repo.update_unit(session, unit=unit, updates=updates, automation=automation)
+    await _recalculate_domain_sizes(session, recipe_id)
     return _unit_to_response(unit)
 
 
@@ -828,6 +874,7 @@ async def delete_unit(
     deleted = await _repo.delete_unit_by_id(session, recipe_id=recipe_id, unit_id=unit_id)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workload unit not found")
+    await _recalculate_domain_sizes(session, recipe_id)
 
 
 # ── Gateways ──────────────────────────────────────────────────────────────────
@@ -857,10 +904,10 @@ async def update_gateway(
     if gw is None or gw.recipe_id != recipe_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gateway not found")
     updates = payload.model_dump(exclude_unset=True)
-    raw_rules = updates.pop("exposure_rules", None)
-    exposure_rules = [r.model_dump() for r in raw_rules] if raw_rules is not None else None
+    raw_rules = updates.pop("ingress_policies", None)
+    ingress_policies = [r.model_dump() for r in raw_rules] if raw_rules is not None else None
     gw = await _repo.update_gateway(
-        session, gateway=gw, updates=updates, exposure_rules=exposure_rules
+        session, gateway=gw, updates=updates, ingress_policies=ingress_policies
     )
     return _gateway_to_response(gw)
 
@@ -882,8 +929,7 @@ async def delete_draft(session: AsyncSession, recipe_id: uuid.UUID) -> None:
     draft = await _repo.get_draft_by_id(session, recipe_id)
     if draft is None:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Draft not found",
+            status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found",
         )
     version_ids = await _repo.get_version_ids_by_draft_id(session, recipe_id)
     if version_ids:
@@ -900,7 +946,6 @@ async def delete_draft(session: AsyncSession, recipe_id: uuid.UUID) -> None:
 
 
 async def _assert_recipe_exists(session: AsyncSession, recipe_id: uuid.UUID) -> None:
-    """Ensure a recipe exists for the given ID."""
     recipe = await _repo.get_full_recipe(session, recipe_id)
     if recipe is None:
         raise HTTPException(

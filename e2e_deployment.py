@@ -102,6 +102,13 @@ class APIClient:
         return self._request("GET", path)
 
 
+# ──────────────────────────── Output reshaping ───────────────────────────────
+
+def _reshape_deployment_output(deployment: dict) -> dict:
+    """Pass-through — deployment response is already in the new structured format."""
+    return deployment
+
+
 # ─────────────────────────────── Pretty printer ───────────────────────────────
 
 def section(title: str) -> None:
@@ -193,23 +200,27 @@ def run(
         create_payload["target_env"] = target_env
 
     create_resp = api.post("/api/v1/deployments", create_payload)
-    deployment_id = create_resp["deployment_id"]
+    deployment_id = create_resp["dep_id"]
     ok("Deployment ID", deployment_id)
-    ok("Message",       create_resp.get("message", ""))
-    ok("Status",        create_resp["status"])
-    ok("Expires at",    create_resp["expires_at"])
-    ok("Team size",     create_resp["team_size"])
+    ok("Target env",    create_resp.get("target_env", "—"))
+    ok("Access method", create_resp.get("access_method", "—"))
 
     # ── Step 3 — Fetch full deployment record ─────────────────────────────────
     section("STEP 3 — Fetch full deployment")
 
     deployment = api.get(f"/api/v1/deployments/{deployment_id}")
-    ok("Created at",         deployment["created_at"])
-    ok("Updated at",         deployment["updated_at"])
-    ok("Member IDs",         deployment.get("member_ids", []))
-    ok("Target env",         deployment.get("target_env", "—"))
-    ok("Experience type",   deployment.get("experience_type", "—"))
-    ok("Exercise instances", len(deployment.get("exercise_instances", [])))
+    recipe_specs = deployment.get("recipe_specs") or {}
+    challenge_specs = deployment.get("challenge_specs") or {}
+    ok("dep_id",           deployment.get("dep_id", "—"))
+    ok("dep_name",         deployment.get("dep_name", "—"))
+    ok("Target env",       deployment.get("target_env", "—"))
+    ok("Participant ID",   deployment.get("participant_id", "—"))
+    ok("Access method",    deployment.get("access_method", "—"))
+    ok("Domains",          len(recipe_specs.get("domains", [])))
+    ok("Workload units",   len(recipe_specs.get("workload_units", [])))
+    ok("Gateway",          bool(recipe_specs.get("gateway")))
+    ok("Challenges",       len(challenge_specs.get("challenges", [])))
+    ok("Execution type",   challenge_specs.get("execution_type", "—"))
 
     # ── Step 4 — Fetch recipe data ────────────────────────────────────────────
     section("STEP 4 — Fetch recipe data")
@@ -221,9 +232,9 @@ def run(
     ok("Workload units",    len(recipe.get("workload_units", [])))
     ok("Enable jumphost ?", recipe.get("enable_jumphost", True))
 
-    # Also inspect the immutable recipe snapshot attached to the deployment.
-    recipe_snapshot = deployment.get("recipe") or {}
-    ok("Snapshot has jumphost_unit", bool(recipe_snapshot.get("jumphost_unit")))
+    # Inspect recipe_specs access_box
+    ok("Has access_box",  bool(recipe_specs.get("access_box")))
+    ok("Global domain",   bool(recipe_specs.get("global_domain")))
 
     # ── Step 5 — Combine and output ───────────────────────────────────────────
     section("STEP 5 — Enriched deployment JSON")
@@ -232,6 +243,7 @@ def run(
         k: v for k, v in deployment.items()
         if k not in ("recipe_version_id", "recipe_draft_id")
     }
+    enriched = _reshape_deployment_output(enriched)
 
     show_json(enriched)
 
@@ -245,8 +257,8 @@ def run(
     print("  Deployment created successfully!")
     print(f"  Draft ID      : {draft_id}")
     print(f"  Deployment ID : {deployment_id}")
-    print(f"  Status        : {deployment['status']}")
-    print(f"  Expires at    : {deployment['expires_at']}")
+    print(f"  dep_name      : {deployment.get('dep_name', '—')}")
+    print(f"  access_method : {deployment.get('access_method', '—')}")
     print(f"{'═' * width}\n")
 
 

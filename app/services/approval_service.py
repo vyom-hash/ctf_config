@@ -206,16 +206,15 @@ async def validate_version_for_deployment(
         version_number=version.version_number,
         approval_status=version.approval_status,
         is_published=version.is_published,
-        checksum=version.checksum,
     )
 
 
-async def validate_version_for_exercise_instance(
+async def validate_version_for_challenge(
     session: AsyncSession,
     version_id: uuid.UUID,
 ) -> DeploymentValidateResponse:
     """
-    Guard used when creating/updating ExerciseInstance records.
+    Guard used when creating/updating Challenge records.
 
     Checks:
       1. Version is valid for deployment (exists, published, approved).

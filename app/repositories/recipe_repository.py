@@ -114,18 +114,14 @@ class RecipeRepository:
         session: AsyncSession,
         *,
         recipe_id: uuid.UUID,
-        segmentation_strategy: str,
-        default_subnet_mask: int,
         gateway_offset: int,
     ) -> RecipeNetworkProfile:
-        """Replace the single network profile for this recipe."""
+        """Replace the single network profile (global_domain) for this recipe."""
         await session.execute(
             delete(RecipeNetworkProfile).where(RecipeNetworkProfile.recipe_id == recipe_id)
         )
         profile = RecipeNetworkProfile(
             recipe_id=recipe_id,
-            segmentation_strategy=segmentation_strategy,
-            default_subnet_mask=default_subnet_mask,
             gateway_offset=gateway_offset,
         )
         session.add(profile)
@@ -153,17 +149,15 @@ class RecipeRepository:
         session: AsyncSession,
         *,
         recipe_id: uuid.UUID,
-        domain_key: str,
+        name: str,
         description: Optional[str],
-        public_ingress_enabled: bool,
-        allow_inter_domain_routing: bool = False,
+        enable_egress: bool = False,
     ) -> RecipeNetworkDomain:
         domain = RecipeNetworkDomain(
             recipe_id=recipe_id,
-            domain_key=domain_key,
+            name=name,
             description=description,
-            public_ingress_enabled=public_ingress_enabled,
-            allow_inter_domain_routing=allow_inter_domain_routing,
+            enable_egress=enable_egress,
         )
         session.add(domain)
         await session.flush()
@@ -195,26 +189,26 @@ class RecipeRepository:
         session: AsyncSession,
         *,
         recipe_id: uuid.UUID,
-        unit_key: str,
-        functional_role: Optional[str],
-        network_position_index: Optional[int],
-        runtime_profile: Optional[str],
-        resource_tier: Optional[str],
-        assigned_domain: Optional[str],
-        connectivity_profile: Optional[str],
-        agent_enabled: bool,
+        name: str,
+        description: Optional[str] = None,
+        allocation_index: Optional[int] = None,
+        runtime_profile: Optional[str] = None,
+        resource_tier: Optional[str] = None,
+        assigned_domain: Optional[str] = None,
+        access_method: Optional[str] = None,
+        unit_control_active: bool = False,
         automation: Optional[dict] = None,
     ) -> RecipeWorkloadUnit:
         unit = RecipeWorkloadUnit(
             recipe_id=recipe_id,
-            unit_key=unit_key,
-            functional_role=functional_role,
-            network_position_index=network_position_index,
+            name=name,
+            description=description,
+            allocation_index=allocation_index,
             runtime_profile=runtime_profile,
             resource_tier=resource_tier,
             assigned_domain=assigned_domain,
-            connectivity_profile=connectivity_profile,
-            agent_enabled=agent_enabled,
+            access_method=access_method,
+            unit_control_active=unit_control_active,
         )
         session.add(unit)
         await session.flush()
@@ -222,9 +216,9 @@ class RecipeRepository:
         if automation:
             ap = RecipeAutomationProfile(
                 workload_unit_id=unit.id,
-                bootstrap_reference=automation.get("bootstrap_reference"),
-                initialization_reference=automation.get("initialization_reference"),
-                health_check_reference=automation.get("health_check_reference"),
+                bootstrap_automation=automation.get("bootstrap_automation"),
+                preflight_automation=automation.get("preflight_automation"),
+                heartbeat_automation=automation.get("heartbeat_automation"),
             )
             session.add(ap)
             await session.flush()
@@ -245,9 +239,6 @@ class RecipeRepository:
         difficulty: Optional[str],
         base_score: Optional[int],
         flag_pattern: Optional[str],
-        experience_mode: Optional[str],
-        sub_category: Optional[str],
-        isolation_strategy: Optional[str],
         linked_unit_ids: list[uuid.UUID],
         hints: list[dict],
     ) -> RecipeChallenge:
@@ -260,9 +251,6 @@ class RecipeRepository:
             difficulty=difficulty,
             base_score=base_score,
             flag_pattern=flag_pattern,
-            experience_mode=experience_mode,
-            sub_category=sub_category,
-            isolation_strategy=isolation_strategy,
         )
         session.add(challenge)
         await session.flush()
@@ -295,8 +283,11 @@ class RecipeRepository:
         runtime_profile: Optional[str],
         resource_tier: Optional[str],
         is_active: bool,
-        exposure_rules: list[dict],
+        secure_shell: bool = False,
+        egress_ip: bool = False,
+        ingress_policies: list[dict] = None,
     ) -> RecipeAccessGateway:
+        exposure_rules = ingress_policies or []
         gateway = RecipeAccessGateway(
             recipe_id=recipe_id,
             gateway_key=gateway_key,
@@ -304,6 +295,8 @@ class RecipeRepository:
             runtime_profile=runtime_profile,
             resource_tier=resource_tier,
             is_active=is_active,
+            secure_shell=secure_shell,
+            egress_ip=egress_ip,
         )
         session.add(gateway)
         await session.flush()
@@ -312,9 +305,12 @@ class RecipeRepository:
             session.add(
                 RecipeGatewayExposureRule(
                     gateway_id=gateway.id,
-                    unit_key=rule.get("unit_key"),
-                    internal_port=rule.get("internal_port"),
-                    transport_protocol=rule.get("transport_protocol"),
+                    wl_unit=rule.get("wl_unit"),
+                    int_port=rule.get("int_port"),
+                    proto=rule.get("proto"),
+                    rule_name=rule.get("name"),
+                    rule_desc=rule.get("desc"),
+                    ext_port=rule.get("ext_port"),
                 )
             )
 
@@ -646,9 +642,13 @@ class RecipeRepository:
         *,
         gateway: RecipeAccessGateway,
         updates: dict,
-        exposure_rules: Optional[list],
+        exposure_rules: Optional[list] = None,
+        ingress_policies: Optional[list] = None,
     ) -> RecipeAccessGateway:
-        scalar_updates = {k: v for k, v in updates.items() if k != "exposure_rules"}
+        # accept both names; ingress_policies takes precedence
+        if ingress_policies is not None:
+            exposure_rules = ingress_policies
+        scalar_updates = {k: v for k, v in updates.items() if k not in ("exposure_rules", "ingress_policies")}
         for key, value in scalar_updates.items():
             setattr(gateway, key, value)
         if exposure_rules is not None:
@@ -661,9 +661,12 @@ class RecipeRepository:
                 session.add(
                     RecipeGatewayExposureRule(
                         gateway_id=gateway.id,
-                        unit_key=rule.get("unit_key"),
-                        internal_port=rule.get("internal_port"),
-                        transport_protocol=rule.get("transport_protocol"),
+                        wl_unit=rule.get("wl_unit"),
+                        int_port=rule.get("int_port"),
+                        proto=rule.get("proto"),
+                        rule_name=rule.get("name"),
+                        rule_desc=rule.get("desc"),
+                        ext_port=rule.get("ext_port"),
                     )
                 )
         await session.flush()

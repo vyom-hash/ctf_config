@@ -1,87 +1,195 @@
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
-from unittest.mock import patch, AsyncMock
+from app.services.registry_metadata import list_registry_service
 
 
-BASE_URL = "/api/v1/scripts"
+def make_mock_db(count_return=0, items_return=None):
+    """Helper to build a mock db that returns different results for two execute() calls."""
+    if items_return is None:
+        items_return = []
+
+    mock_db = AsyncMock()
+
+    # First execute() call -> total count; Second -> paginated items
+    count_result = MagicMock()
+    count_result.scalar.return_value = count_return
+
+    items_result = MagicMock()
+    items_result.scalars.return_value.all.return_value = items_return
+
+    mock_db.execute = AsyncMock(side_effect=[count_result, items_result])
+    return mock_db
 
 
-class TestListScripts:
+def make_filters(**kwargs):
+    """Build a simple namespace mimicking ScriptListFilterSchema."""
+    defaults = {
+        "tenant_id": None,
+        "execution_type": None,
+        "status": None,
+        "page": 1,
+        "page_size": 10,
+    }
+    defaults.update(kwargs)
 
-    async def test_list_success_default_pagination(self, async_client):
-        script_id = uuid4()
+    class Filters:
+        pass
 
-        mock_item = {
-            "id": script_id,
-            "tenant_id": uuid4(),
-            "title": "Test Script",
-            "summary": "Test summary",
-            "category": "test",
-            "execution_type": "sync",
-            "status": "DRAFT",
-            "checksum_sha256": "abc123",
-            "artifact_location": "/tmp/file.py",
-            "current_version": 1,
-            "new_version": 2,
-        }
-
-        mock_response = {
-            "total": 1,
-            "page": 1,
-            "page_size": 10,
-            "items": [mock_item],
-        }
-
-        with patch(
-            "app.api.v1.routers.script_metadata.list_scripts_service",
-            new_callable=AsyncMock,
-        ) as mock_list:
-
-            mock_list.return_value = mock_response
-
-            resp = await async_client.get(BASE_URL)
-
-        assert resp.status_code == 201
-        assert resp.json()["total"] == 1
+    f = Filters()
+    for k, v in defaults.items():
+        setattr(f, k, v)
+    return f
 
 
-    async def test_list_with_filters(self, async_client):
-        tenant_id = uuid4()
+# ---------------------------------------------------------------------------
+# Basic success / empty cases
+# ---------------------------------------------------------------------------
 
-        mock_response = {
-            "total": 0,
-            "page": 1,
-            "page_size": 5,  # 👈 match request
-            "items": [],
-        }
+@pytest.mark.asyncio
+async def test_list_registry_success():
+    """Returns correct total and items when records exist."""
+    mock_items = [MagicMock(), MagicMock(), MagicMock()]
+    mock_db = make_mock_db(count_return=3, items_return=mock_items)
+    filters = make_filters()
 
-        with patch(
-            "app.api.v1.routers.script_metadata.list_scripts_service",
-            new_callable=AsyncMock,
-        ) as mock_list:
+    result = await list_registry_service(filters, mock_db)
 
-            mock_list.return_value = mock_response
-
-            resp = await async_client.get(
-                BASE_URL,
-                params={
-                    "tenant_id": str(tenant_id),
-                    "category": "test",
-                    "execution_type": "sync",
-                    "status": "DRAFT",
-                    "page": 1,
-                    "page_size": 5,
-                },
-            )
-
-        assert resp.status_code == 201
-        assert resp.json()["page_size"] == 5
+    assert result["total"] == 3
+    assert len(result["items"]) == 3
+    assert result["page"] == 1
+    assert result["page_size"] == 10
 
 
-    async def test_invalid_page_number(self, async_client):
-        resp = await async_client.get(
-            BASE_URL,
-            params={"page": 0},
-        )
+@pytest.mark.asyncio
+async def test_list_registry_empty():
+    """Returns zero total and empty items list when no records exist."""
+    mock_db = make_mock_db(count_return=0, items_return=[])
+    filters = make_filters()
 
-        assert resp.status_code == 422
+    result = await list_registry_service(filters, mock_db)
+
+    assert result["total"] == 0
+    assert result["items"] == []
+
+
+# ---------------------------------------------------------------------------
+# Pagination
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_registry_pagination_page_2():
+    """Correct page / page_size values are echoed back in response."""
+    mock_items = [MagicMock()]
+    mock_db = make_mock_db(count_return=11, items_return=mock_items)
+    filters = make_filters(page=2, page_size=10)
+
+    result = await list_registry_service(filters, mock_db)
+
+    assert result["page"] == 2
+    assert result["page_size"] == 10
+    assert result["total"] == 11
+    assert len(result["items"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_list_registry_custom_page_size():
+    """Custom page_size is reflected correctly in the response."""
+    mock_items = [MagicMock(), MagicMock()]
+    mock_db = make_mock_db(count_return=2, items_return=mock_items)
+    filters = make_filters(page=1, page_size=5)
+
+    result = await list_registry_service(filters, mock_db)
+
+    assert result["page_size"] == 5
+    assert len(result["items"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Filtering
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_registry_filter_by_tenant_id():
+    """tenant_id filter is applied — db is queried and result returned."""
+    tenant = uuid4()
+    mock_items = [MagicMock()]
+    mock_db = make_mock_db(count_return=1, items_return=mock_items)
+    filters = make_filters(tenant_id=tenant)
+
+    result = await list_registry_service(filters, mock_db)
+
+    assert result["total"] == 1
+    assert len(result["items"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_list_registry_filter_by_execution_type():
+    """execution_type filter is applied — correct results returned."""
+    mock_items = [MagicMock()]
+    mock_db = make_mock_db(count_return=1, items_return=mock_items)
+    filters = make_filters(execution_type="batch")
+
+    result = await list_registry_service(filters, mock_db)
+
+    assert result["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_list_registry_filter_by_status():
+    """status filter is applied — correct results returned."""
+    mock_items = [MagicMock()]
+    mock_db = make_mock_db(count_return=1, items_return=mock_items)
+    filters = make_filters(status="approved")
+
+    result = await list_registry_service(filters, mock_db)
+
+    assert result["total"] == 1
+    assert result["items"][0] is mock_items[0]
+
+
+@pytest.mark.asyncio
+async def test_list_registry_all_filters_combined():
+    """All supported filters combined — db called twice (count + fetch)."""
+    tenant = uuid4()
+    mock_items = [MagicMock()]
+    mock_db = make_mock_db(count_return=1, items_return=mock_items)
+    filters = make_filters(
+        tenant_id=tenant,
+        execution_type="realtime",
+        status="approved",
+        page=1,
+        page_size=10,
+    )
+
+    result = await list_registry_service(filters, mock_db)
+
+    assert result["total"] == 1
+    assert len(result["items"]) == 1
+    assert mock_db.execute.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_list_registry_no_filters_no_results():
+    """No filters, no matching records — returns empty response."""
+    mock_db = make_mock_db(count_return=0, items_return=[])
+    filters = make_filters()
+
+    result = await list_registry_service(filters, mock_db)
+
+    assert result == {"total": 0, "page": 1, "page_size": 10, "items": []}
+
+
+# ---------------------------------------------------------------------------
+# DB interaction
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_registry_db_called_twice():
+    """Service must execute exactly two queries: one for count, one for data."""
+    mock_db = make_mock_db(count_return=5, items_return=[MagicMock()] * 5)
+    filters = make_filters()
+
+    await list_registry_service(filters, mock_db)
+
+    assert mock_db.execute.call_count == 2

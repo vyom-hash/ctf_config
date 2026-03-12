@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     OPENSTACK_PROJECT_DOMAIN_NAME: str = os.getenv("OPENSTACK_PROJECT_DOMAIN_NAME", "Default")
     OPENSTACK_REGION_NAME: str = os.getenv("OPENSTACK_REGION_NAME", "")
 
+    MINIO_ENDPOINT: str = ""
+    MINIO_PORT: int = 9000
+    MINIO_ACCESS_KEY: str = ""
+    MINIO_SECRET_KEY: str = ""
+    MINIO_SECURE: bool = False
+    MINIO_SCRIPT_BUCKET: str = "scripts"
+
     # ── Database ─────────────────────────────────────────────────────────────
     DATABASE_URL: str
     DB_POOL_SIZE: int = 20

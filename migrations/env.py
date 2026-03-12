@@ -45,8 +45,11 @@ from sqlalchemy.pool import NullPool
 from app.core.database import Base
 from app.models import deployment         # noqa: F401
 from app.models import recipe             # noqa: F401
-from app.models import exercise_instance  # noqa: F401
-from app.models import cloud_provider  # noqa: F401
+from app.models import challenge          # noqa: F401
+from app.models import cloud_provider     # noqa: F401
+from app.models import resource_tier      # noqa: F401
+from app.models import openstack_resource_tier  # noqa: F401
+from app.models.registry_metadata import RegistryMetadata, RegistryRevision
 
 config = context.config
 

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-CTF Config Service — end-to-end exercises API demo.
+CTF Config Service — end-to-end challenges API demo.
 
-Demonstrates the exercises-as-superset / recipe-as-subset pattern:
+Demonstrates the challenges-as-superset / recipe-as-subset pattern:
 
   1.  Create a recipe draft and publish it (condensed from e2e_recipe.py).
-  2.  Create 1 ExerciseInstance bound to the published recipe version (1:1 mapping).
+  2.  Create Challenge instances bound to the published recipe version (1:1 mapping).
   3.  GET /api/v1/recipes/{id}        → recipe JSON includes `exercises` array
-                                        where each exercise embeds `recipe` subset.
+                                        where each challenge embeds `recipe` subset.
   4.  Print the enriched JSON blob.
 
 Usage
@@ -164,79 +164,91 @@ def _create_and_publish_recipe(api: APIClient) -> tuple[str, str, str, list[str]
     # Step 2 — Network profile
     section("PHASE 1 / STEP 2 — Network profile")
     api.put(f"/api/v1/recipes/{recipe_id}/network-profile", {
-        "segmentation_strategy": "multi_net",
-        "default_subnet_mask":   24,
-        "gateway_offset":        1,
-        "dns_resolvers":         ["8.8.8.8", "1.1.1.1"],
+        "gw_offset":     1,
+        "dns_resolvers": ["8.8.8.8", "1.1.1.1"],
     })
     ok("Network profile set")
 
     # Step 3 — Domains
     section("PHASE 1 / STEP 3 — Domains")
     for d in [
-        {"domain_key": "internal-net", "description": "Isolated target network",
-         "public_ingress_enabled": False},
-        {"domain_key": "dmz", "description": "Public-facing segment",
-         "public_ingress_enabled": True},
+        {"name": "internal-net", "description": "Isolated target network",
+         "enable_egress": False},
+        {"name": "dmz", "description": "Public-facing segment",
+         "enable_egress": True},
     ]:
         r = api.post(f"/api/v1/recipes/{recipe_id}/domains", d)
-        ok("Domain added", f"key={r['domain_key']}")
+        ok("Domain added", f"name={r['name']}")
 
     # Step 4 — Workload units
     section("PHASE 1 / STEP 4 — Workload units")
     unit_keys = []
     for u in [
         {
-            "unit_key":              "web-server-01",
-            "functional_role":       "target",
-            "network_position_index": 1,
-            "runtime_profile":       "debian-bullseye-slim",
-            "resource_tier":         "medium",
-            "assigned_domain":       "dmz",
-            "agent_enabled":         True,
+            "name":               "web-server-01",
+            "description":        "Web server target",
+            "allocation_index":   1,
+            "runtime_profile":    "debian-bullseye-slim",
+            "resource_tier":      "medium",
+            "assigned_domain":    "dmz",
+            "unit_control_active": True,
             "automation_profile": {
-                "bootstrap_reference":     "scripts/web/bootstrap.sh",
-                "initialization_reference": "scripts/web/init.sh",
-                "health_check_reference":  "scripts/web/healthcheck.sh",
+                "bootstrap_automation":  "scripts/web/bootstrap.sh",
+                "preflight_automation":  "scripts/web/init.sh",
+                "heartbeat_automation":  "scripts/web/healthcheck.sh",
             },
         },
         {
-            "unit_key":              "db-server-01",
-            "functional_role":       "target",
-            "network_position_index": 2,
-            "runtime_profile":       "postgres-15-alpine",
-            "resource_tier":         "large",
-            "assigned_domain":       "internal-net",
-            "agent_enabled":         False,
+            "name":               "db-server-01",
+            "description":        "Database target",
+            "allocation_index":   2,
+            "runtime_profile":    "postgres-15-alpine",
+            "resource_tier":      "large",
+            "assigned_domain":    "internal-net",
+            "unit_control_active": False,
         },
         {
-            "unit_key":              "attacker-kali",
-            "functional_role":       "attacker",
-            "network_position_index": 3,
-            "runtime_profile":       "kali-rolling",
-            "resource_tier":         "medium",
-            "assigned_domain":       "dmz",
-            "agent_enabled":         True,
+            "name":               "attacker-kali",
+            "description":        "Attacker machine",
+            "allocation_index":   3,
+            "runtime_profile":    "kali-rolling",
+            "resource_tier":      "medium",
+            "assigned_domain":    "dmz",
+            "unit_control_active": True,
         },
     ]:
         r = api.post(f"/api/v1/recipes/{recipe_id}/units", u)
-        unit_keys.append(r["unit_key"])
-        ok("Unit added", f"key={r['unit_key']}")
+        unit_keys.append(r["name"])
+        ok("Unit added", f"name={r['name']}")
 
     # Step 5 — Gateway
     section("PHASE 1 / STEP 5 — Gateway")
     gw = api.post(f"/api/v1/recipes/{recipe_id}/gateways", {
         "gateway_key": "edge-gw-01", "gateway_type": "vyos",
         "runtime_profile": "oe:gateway", "resource_tier": "md", "is_active": True,
-        "exposure_rules": [
-            {"unit_key": "web-server-01", "internal_port": 80, "transport_protocol": "tcp"},
-            {"unit_key": "attacker-kali", "internal_port": 22, "transport_protocol": "tcp"},
+        "secure_shell": True, "egress_ip": False,
+        "ingress_policies": [
+            {"wl_unit": "web-server-01", "int_port": 80, "proto": "tcp", "name": "http", "ext_port": 80},
+            {"wl_unit": "attacker-kali", "int_port": 22, "proto": "tcp", "name": "ssh",  "ext_port": 22},
         ],
     })
     ok("Gateway added", f"key={gw['gateway_key']}")
 
-    # Step 6 — Validate
-    section("PHASE 1 / STEP 6 — Validate")
+    # Step 6 — Jumphost unit
+    section("PHASE 1 / STEP 6 — Jumphost unit")
+    jh = api.put(f"/api/v1/recipes/{recipe_id}/jumphost", {
+        "enable": True,
+        "allow_vnc": True,
+        "resource_tier": "md",
+        "assigned_domain": "internal",
+        "runtime_profile": "oe:jumphost",
+        "egress_ip": False,
+        "allocation_index": 5,
+    })
+    ok("Jumphost unit set", f"runtime_profile={jh['runtime_profile']}")
+
+    # Step 7 — Validate
+    section("PHASE 1 / STEP 7 — Validate")
     val = api.post(f"/api/v1/recipes/{recipe_id}/validate")
     if not val["is_valid"]:
         for err in val["errors"]:
@@ -244,8 +256,8 @@ def _create_and_publish_recipe(api: APIClient) -> tuple[str, str, str, list[str]
         sys.exit(1)
     ok("Validation passed")
 
-    # Step 7 — Submit for approval
-    section("PHASE 1 / STEP 7 — Submit for approval")
+    # Step 8 — Submit for approval
+    section("PHASE 1 / STEP 8 — Submit for approval")
     submit = api.post(f"/api/v1/recipes/{recipe_id}/submit")
     ok("Approval status", submit["approval_status"])
     if submit["approval_status"] != "APPROVED":
@@ -255,8 +267,8 @@ def _create_and_publish_recipe(api: APIClient) -> tuple[str, str, str, list[str]
         )
         sys.exit(0)
 
-    # Step 8 — Publish
-    section("PHASE 1 / STEP 8 — Publish")
+    # Step 9 — Publish
+    section("PHASE 1 / STEP 9 — Publish")
     published = api.post(f"/api/v1/recipes/{recipe_id}/publish")
     recipe_version_id = published["recipe_version_id"]
     ok("Version number", published["version_number"])
@@ -276,8 +288,8 @@ def _create_exercises(
     target_units: list[str] = None,
 ) -> list[dict]:
     """
-    Create exercise instances bound to the recipe version.
-    Returns list of created exercise dicts.
+    Create challenge instances bound to the recipe version.
+    Returns list of created challenge dicts.
     """
     if target_units is None:
         target_units = []
@@ -294,9 +306,9 @@ def _create_exercises(
                 "Exploit a classic SQL injection vulnerability in the login form "
                 "to bypass authentication and retrieve the hidden admin flag."
             ),
-            "lab_environment_ref": "tpl-web-sqli-v2",
+            "verification_automation": "tpl-web-sqli-v2",
             "scoring_type":     "decay",
-            "experience_mode":  "guided",
+            "type":             "guided",
             "progression_mode": "independent",
             "resource_scope":   "per_user",
             "sub_category":     "selfpaced",
@@ -306,27 +318,30 @@ def _create_exercises(
                     "flag_template":  "CTF{sql1_byp4ss_{uuid}}",
                     "custom_evaluator": None,
                     "target_units": ["web-server-01"],
+                    "flag_store": {
+                        "category":        "file",
+                        "location":        "/var/www/html/.flag",
+                        "file_permission": "0440",
+                        "file_owner":      "www-data",
+                        "file_group":      "www-data",
+                        "mkdir":           False,
+                        "type":            "rewrite",
+                    },
                 },
             ],
-            "guidance_steps": [
+            "hints": [
                 {
-                    "order":               1,
-                    "type":               "conceptual",
-                    "content":            "Look carefully at how the login query is constructed. Is user input sanitized?",
-                    "penalty_points":      50,
-                    "unlock_after_minutes": 15,
+                    "hint":           "Look carefully at how the login query is constructed. Is user input sanitized?",
+                    "points_impacted": 50,
                 },
                 {
-                    "order":               2,
-                    "type":               "directional",
-                    "content":            "Try adding a single quote after the username field and observe the error response.",
-                    "penalty_points":      100,
-                    "unlock_after_minutes": 30,
+                    "hint":           "Try adding a single quote after the username field and observe the error response.",
+                    "points_impacted": 100,
                 },
             ],
-            "point_checkpoints": [
-                {"label": "Identified injection point", "points": 75},
-                {"label": "Extracted admin credentials",  "points": 150},
+            "objectives": [
+                {"goal": "Identified injection point",  "points_impacted": 75},
+                {"goal": "Extracted admin credentials", "points_impacted": 150},
             ],
         },
         # Exercise 2: Jeopardy Mode (No guidance steps or checkpoints)
@@ -341,9 +356,9 @@ def _create_exercises(
                 "A classic Jeopardy-style challenge. You are given a ciphertext and a known plain text format. "
                 "Can you reverse the XOR operation to retrieve the flag?"
             ),
-            "lab_environment_ref": None,  # Often no lab environment needed for crypto
+            "verification_automation": None,
             "scoring_type":     "flat",
-            "experience_mode":  "jeopardy",
+            "type":             "jeopardy",
             "progression_mode": "independent",
             "resource_scope":   "per_user",
             "sub_category":     "selfpaced",
@@ -353,21 +368,39 @@ def _create_exercises(
                     "flag_template":  "CTF{x0r_1s_l0v3_{uuid}}",
                     "custom_evaluator": None,
                     "target_units": target_units,
+                    "flag_store": {
+                        "category":        "file",
+                        "location":        "/opt/challenge/flag.txt",
+                        "file_permission": "0444",
+                        "file_owner":      "root",
+                        "file_group":      "root",
+                        "mkdir":           True,
+                        "type":            "add",
+                    },
                 },
             ],
         },
     ]
 
     if experience_mode != "both":
-        exercises_payload = [ep for ep in exercises_payload if ep.get("experience_mode") == experience_mode]
+        exercises_payload = [ep for ep in exercises_payload if ep.get("type") == experience_mode]
 
     created = []
     for payload in exercises_payload:
-        r = api.post("/api/v1/exercise-instances", payload)
+        r = api.post("/api/v1/challenges", payload)
         created.append(r)
-        ok("Exercise created", f"slug={payload['instance_slug']}  id={r['id']}")
+        ok("Challenge created", f"slug={payload['instance_slug']}  id={r['id']}")
 
     return created
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Output reshaping — match target deployment response format
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _reshape_deployment_output(deployment: dict) -> dict:
+    """Pass-through — deployment response is already in the new structured format."""
+    return deployment
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -399,45 +432,54 @@ def run(
         # Extract target units if using existing recipe
         unit_keys = []
         for unit in detail.get("workload_units", []):
-            if unit.get("functional_role") == "target":
-                 unit_keys.append(unit.get("unit_key"))
+            unit_keys.append(unit.get("name"))
                  
         ok("Recipe id", recipe_id)
         ok("Recipe version id", recipe_version_id)
     else:
         recipe_id, recipe_version_id, recipe_name, unit_keys = _create_and_publish_recipe(api)
 
-    # ── Phase 2: Create exercise instances ───────────────────────────────────
-    section("PHASE 2 — Create exercise instances (superset)")
+    # ── Phase 2: Create challenges ────────────────────────────────────────────
+    section("PHASE 2 — Create challenges (superset)")
     exercises = _create_exercises(api, recipe_version_id, experience_mode, unit_keys)
-    ok("Exercises created", len(exercises))
+    ok("Challenges created", len(exercises))
 
-    # ── Phase 3: GET recipe — exercises as superset, recipe as subset ────────
-    section("PHASE 3 — GET recipe (exercises as superset with embedded recipe subset)")
-    recipe_detail = api.get(f"/api/v1/recipes/{recipe_id}")
+    # ── Phase 3: Create deployment ────────────────────────────────────────────
+    section("PHASE 3 — Create deployment")
+    create_payload: dict = {
+        "recipe_version_id": recipe_version_id,
+        "access": {
+            "entry_method":          "gateway",
+            "ssh_public_key_ref":    "secret://org/default-ssh-key",
+            "floating_ip_enabled":   False,
+            "remote_console_enabled": True,
+        },
+        "target_env": "d1-taget-cloud",
+    }
+    create_resp = api.post("/api/v1/deployments", create_payload)
+    deployment_id = create_resp["dep_id"]
+    ok("Deployment ID", deployment_id)
+    ok("Target env",    create_resp.get("target_env", "—"))
 
-    print(f"\n  Recipe has {len(recipe_detail.get('exercises', []))} exercise(s)\n")
-    for ex in recipe_detail.get("exercises", []):
-        r = ex.get("recipe") or {}
-        print(f"  ┌─ Exercise: {ex.get('title')}")
-        print(f"  │  id         : {ex.get('id')}")
-        print(f"  │  difficulty : {ex.get('difficulty')}")
-        print(f"  │  points     : {ex.get('reward_points')}")
-        print(f"  │  targets    : {len(ex.get('validation_targets', []))}")
-        print(f"  │  guidance   : {len(ex.get('guidance_steps', []))}")
-        print(f"  │  checkpoints: {len(ex.get('point_checkpoints', []))}")
-        print("  │  ─── recipe (subset) ───")
-        print(f"  │  recipe_id  : {r.get('recipe_id')}")
-        print(f"  │  name       : {r.get('name')}")
-        print(f"  │  category   : {r.get('category')}")
-        print(f"  │  version    : v{r.get('version_number')}")
-        print(f"  └─ version_id : {r.get('recipe_version_id')}")
+    # ── Phase 4: GET full deployment ──────────────────────────────────────────
+    section("PHASE 4 — Fetch deployment (recipe_specs + challenge_specs)")
+    deployment = api.get(f"/api/v1/deployments/{deployment_id}")
+    recipe_specs = deployment.get("recipe_specs") or {}
+    challenge_specs = deployment.get("challenge_specs") or {}
+    challenges = challenge_specs.get("challenges") or []
+    ok("recipe_specs present",    bool(recipe_specs))
+    ok("Challenges",              len(challenges))
+    ok("Execution type",          challenge_specs.get("execution_type", "—"))
+    for ch in challenges:
+        print(f"  ┌─ Challenge : {ch.get('title')}")
+        print(f"  │  id        : {ch.get('id')}")
+        print(f"  │  level     : {ch.get('level')}")
+        print(f"  └─ points    : {ch.get('points')}")
 
     # ── Final JSON output ────────────────────────────────────────────────────
-    exercises_list = recipe_detail.get("exercises", [])
-    final_output = exercises_list[0] if exercises_list else {}
+    final_output = _reshape_deployment_output(deployment)
 
-    section("FINAL — Enriched JSON (exercises as superset, recipe as subset)")
+    section("FINAL — Enriched deployment JSON (recipe_spec + challenges)")
     show_json(final_output)
 
     if output_file:
@@ -446,10 +488,11 @@ def run(
         print(f"\n  JSON written to: {output_file}")
 
     print(f"\n{'═' * 72}")
-    print(f"  Recipe '{recipe_name}' — exercises demo complete!")
+    print(f"  Recipe '{recipe_name}' — deployment demo complete!")
     print(f"  Recipe ID        : {recipe_id}")
     print(f"  Recipe Version ID: {recipe_version_id}")
-    print(f"  Exercises created: {len(exercises)}")
+    print(f"  Deployment dep_id: {deployment_id}")
+    print(f"  Challenges created: {len(exercises)}")
     print(f"{'═' * 72}\n")
 
 
@@ -459,7 +502,7 @@ def main() -> None:
     default_secret = _load_secret_from_env()
 
     parser = argparse.ArgumentParser(
-        description="E2E exercises demo — exercises as superset, recipe as subset"
+        description="E2E challenges demo — challenges as superset, recipe as subset"
     )
     parser.add_argument(
         "--base-url", default="http://localhost:8000",

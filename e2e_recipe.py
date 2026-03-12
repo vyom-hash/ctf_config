@@ -161,80 +161,77 @@ def run(base_url: str, secret: str) -> None:
     section("STEP 2 — Configure network profile")
 
     net_payload = {
-        "segmentation_strategy": "multi_net",
-        "default_subnet_mask":   24,
-        "gateway_offset":        1,
-        "dns_resolvers":         ["8.8.8.8", "1.1.1.1"],
+        "gw_offset":     1,
+        "dns_resolvers": ["8.8.8.8", "1.1.1.1"],
     }
     net = api.put(f"/api/v1/recipes/{recipe_id}/network-profile", net_payload)
-    ok("Strategy", net["segmentation_strategy"])
-    ok("Subnet mask", f"/{net['default_subnet_mask']}")
-    ok("DNS resolvers", net["dns_resolvers"])
+    ok("GW offset", net["gw_offset"])
+    ok("DNS resolvers", net["dns"])
 
     # ── Step 3 — Domains ──────────────────────────────────────────────────────
     section("STEP 3 — Add network domains")
 
     domains_payload = [
         {
-            "domain_key":                "internal-net",
-            "description":              "Internal target network (isolated)",
-            "public_ingress_enabled":    False,
+            "name":          "internal-net",
+            "description":   "Internal target network (isolated)",
+            "enable_egress": False,
         },
         {
-            "domain_key":                "dmz",
-            "description":              "DMZ — public-facing segment",
-            "public_ingress_enabled":    True,
+            "name":          "dmz",
+            "description":   "DMZ — public-facing segment",
+            "enable_egress": True,
         },
     ]
     for d in domains_payload:
         r = api.post(f"/api/v1/recipes/{recipe_id}/domains", d)
-        ok("Domain added", f"key={r['domain_key']}  id={r['id']}")
+        ok("Domain added", f"name={r['name']}  id={r['id']}")
 
     # ── Step 4 — Workload units ───────────────────────────────────────────────
     section("STEP 4 — Add workload units")
 
     units_payload = [
         {
-            "unit_key":              "web-server-01",
-            "functional_role":       "target",
-            "network_position_index": 1,
-            "runtime_profile":       "debian-bullseye-slim",
-            "resource_tier":         "medium",
-            "assigned_domain":       "dmz",
-            "agent_enabled":         True,
+            "name":               "web-server-01",
+            "description":        "Web server target",
+            "allocation_index":   1,
+            "runtime_profile":    "debian-bullseye-slim",
+            "resource_tier":      "medium",
+            "assigned_domain":    "dmz",
+            "unit_control_active": True,
             "automation_profile": {
-                "bootstrap_reference":     "scripts/web/bootstrap.sh",
-                "initialization_reference": "scripts/web/init.sh",
-                "health_check_reference":  "scripts/web/healthcheck.sh",
+                "bootstrap_automation":  "scripts/web/bootstrap.sh",
+                "preflight_automation":  "scripts/web/init.sh",
+                "heartbeat_automation":  "scripts/web/healthcheck.sh",
             },
         },
         {
-            "unit_key":              "db-server-01",
-            "functional_role":       "target",
-            "network_position_index": 2,
-            "runtime_profile":       "postgres-15-alpine",
-            "resource_tier":         "large",
-            "assigned_domain":       "internal-net",
-            "agent_enabled":         False,
+            "name":               "db-server-01",
+            "description":        "Database target",
+            "allocation_index":   2,
+            "runtime_profile":    "postgres-15-alpine",
+            "resource_tier":      "large",
+            "assigned_domain":    "internal-net",
+            "unit_control_active": False,
         },
         {
-            "unit_key":              "attacker-kali",
-            "functional_role":       "attacker",
-            "network_position_index": 3,
-            "runtime_profile":       "kali-rolling",
-            "resource_tier":         "medium",
-            "assigned_domain":       "dmz",
-            "agent_enabled":         True,
+            "name":               "attacker-kali",
+            "description":        "Attacker machine",
+            "allocation_index":   3,
+            "runtime_profile":    "kali-rolling",
+            "resource_tier":      "medium",
+            "assigned_domain":    "dmz",
+            "unit_control_active": True,
         },
     ]
 
     unit_ids: dict[str, str] = {}
     for u in units_payload:
         r = api.post(f"/api/v1/recipes/{recipe_id}/units", u)
-        unit_ids[u["unit_key"]] = r["id"]
-        ok("Unit added", f"key={r['unit_key']}  id={r['id']}")
+        unit_ids[u["name"]] = r["id"]
+        ok("Unit added", f"name={r['name']}  id={r['id']}")
 
-    # Challenges are defined by exercise instance, not on the recipe.
+    # Challenges are created separately via POST /api/v1/challenges, not on the recipe.
 
     # ── Step 5 — Gateway ──────────────────────────────────────────────────────
     section("STEP 5 — Add access gateway")
@@ -245,15 +242,17 @@ def run(base_url: str, secret: str) -> None:
         "runtime_profile": "oe:gateway",
         "resource_tier":   "md",
         "is_active":       True,
-        "exposure_rules": [
-            {"unit_key": "web-server-01", "internal_port": 80,   "transport_protocol": "tcp"},
-            {"unit_key": "web-server-01", "internal_port": 443,  "transport_protocol": "tcp"},
-            {"unit_key": "attacker-kali", "internal_port": 22,   "transport_protocol": "tcp"},
+        "secure_shell":    True,
+        "egress_ip":       False,
+        "ingress_policies": [
+            {"wl_unit": "web-server-01", "int_port": 80,  "proto": "tcp", "name": "http",  "ext_port": 80},
+            {"wl_unit": "web-server-01", "int_port": 443, "proto": "tcp", "name": "https", "ext_port": 443},
+            {"wl_unit": "attacker-kali", "int_port": 22,  "proto": "tcp", "name": "ssh",   "ext_port": 22},
         ],
     }
     gw = api.post(f"/api/v1/recipes/{recipe_id}/gateways", gateway_payload)
     ok("Gateway added", f"key={gw['gateway_key']}  id={gw['id']}")
-    ok("Exposure rules", f"{len(gw['exposure_rules'])} rules")
+    ok("Ingress policies", f"{len(gw['ingress_policies'])} rules")
 
     # ── Step 6 — Validate ─────────────────────────────────────────────────────
     section("STEP 6 — Validate draft")
@@ -287,7 +286,7 @@ def run(base_url: str, secret: str) -> None:
     published = api.post(f"/api/v1/recipes/{recipe_id}/publish")
     ok("Version",  published["version_number"])
     ok("Version ID", published["recipe_version_id"])
-    ok("Checksum", published["checksum"])
+    #ok("Checksum", published["checksum"])
     ok("Status",   published.get("status", "published"))
 
     # ── Final output — full recipe detail ─────────────────────────────────────
@@ -301,7 +300,7 @@ def run(base_url: str, secret: str) -> None:
     print(f"  Recipe ID       : {recipe_id}")
     print(f"  Recipe Version  : {published['recipe_version_id']}")
     print(f"  Version Number  : {published['version_number']}")
-    print(f"  SHA-256 Checksum: {published['checksum']}")
+    #print(f"  SHA-256 Checksum: {published['checksum']}")
     print(f"{'═' * 72}\n")
 
 

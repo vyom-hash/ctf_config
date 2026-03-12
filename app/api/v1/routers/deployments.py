@@ -5,9 +5,9 @@ Endpoint
 ────────
   POST /api/v1/deployments  (single creation endpoint)
     Two modes (one of which must be used):
-    - By version id: recipe_version_id + optional name, member_ids, access.
+    - By version id: recipe_version_id + optional name, participant_id, access.
     - By recipe: recipe_id, recipe_version, initiator_user,
-      experience_type, duration_hours, access_mode + optional name, access.
+      experience_type, duration_hours, access_method + optional name, access.
     Responses include hardcoded provider_profile (not stored in DB).
     Validates version exists/published/approved, team_configuration, concurrency limit.
     On success → 201 with deployment record (status ALLOCATING).
@@ -90,9 +90,9 @@ async def create_deployment(
     """
     Create a deployment. One of two modes:
 
-    - **By version id:** `recipe_version_id` + optional name, member_ids, access.
+    - **By version id:** `recipe_version_id` + optional name, participant_id, access.
     - **By recipe:** `recipe_id`, `recipe_version`, `initiator_user`,
-      `experience_type`, `duration_hours`, `access_mode` + optional name, access.
+      `experience_type`, `duration_hours`, `access_method` + optional name, access.
     Response includes `provider_profile` (hardcoded constant).
     """
     return await deployment_service.create_deployment_unified(

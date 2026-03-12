@@ -25,9 +25,10 @@ from app.api.schemas.recipe import (
     GatewayCreate,
     GatewayResponse,
     GatewayUpdate,
+    GlobalDomainConfig,
+    GlobalDomainResponse,
+    JumphostUnitInput,
     ListRecipesResponse,
-    NetworkProfileConfig,
-    NetworkProfileResponse,
     PublishedRecipeResponse,
     ReviewRequest,
     ReviewResponse,
@@ -37,6 +38,10 @@ from app.api.schemas.recipe import (
     WorkloadUnitResponse,
     WorkloadUnitUpdate,
 )
+
+# Aliases for backward compat within this router
+NetworkProfileConfig = GlobalDomainConfig
+NetworkProfileResponse = GlobalDomainResponse
 from app.core.database import get_db
 from app.core.security import get_current_user_id
 from app.services import approval_service as _approval_svc
@@ -164,8 +169,8 @@ async def configure_network_profile(
     db: DB,
     _: CurrentUser,
 ) -> NetworkProfileResponse:
-    await _recipe_svc.configure_network_profile(db, recipe_id, payload)
-    return await _recipe_svc.get_network_profile(db, recipe_id)
+    await _recipe_svc.configure_global_domain(db, recipe_id, payload)
+    return await _recipe_svc.get_global_domain(db, recipe_id)
 
 
 @router.get(
@@ -180,7 +185,7 @@ async def get_network_profile(
     db: DB,
     _: CurrentUser,
 ) -> NetworkProfileResponse:
-    return await _recipe_svc.get_network_profile(db, recipe_id)
+    return await _recipe_svc.get_global_domain(db, recipe_id)
 
 
 # ── Step 3 — Network domains ──────────────────────────────────────────────────
@@ -202,7 +207,7 @@ async def add_domain(
 ) -> DomainResponse:
     await _recipe_svc.add_domain(db, recipe_id, payload)
     domains = await _recipe_svc.list_domains(db, recipe_id)
-    return next(d for d in reversed(domains) if d.domain_key == payload.domain_key)
+    return next(d for d in reversed(domains) if d.name == payload.name)
 
 
 @router.get(
@@ -291,7 +296,7 @@ async def add_workload_unit(
 ) -> WorkloadUnitResponse:
     await _recipe_svc.add_workload_unit(db, recipe_id, payload)
     units = await _recipe_svc.list_units(db, recipe_id)
-    return next(u for u in reversed(units) if u.unit_key == payload.unit_key)
+    return next(u for u in reversed(units) if u.name == payload.name)
 
 
 @router.get(
@@ -448,6 +453,22 @@ async def delete_gateway(
 ) -> Response:
     await _recipe_svc.delete_gateway(db, recipe_id, gateway_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.put(
+    "/{recipe_id}/jumphost",
+    summary="Set jumphost unit",
+    description="Configure the jumphost unit for this recipe. Stored as part of the recipe spec and included in the published snapshot.",
+    operation_id="recipes.jumphost.set",
+    responses=RESPONSES_DRAFT,
+)
+async def set_jumphost_unit(
+    recipe_id: uuid.UUID,
+    payload: JumphostUnitInput,
+    db: DB,
+    _: CurrentUser,
+) -> dict:
+    return await _recipe_svc.set_jumphost_unit(db, recipe_id, payload)
 
 
 @router.post(
